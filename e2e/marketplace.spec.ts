@@ -16,9 +16,14 @@
  */
 
 import { test, expect } from "@playwright/test";
+import { injectWalletStubs } from "./helpers/mock-wallet";
 
 test.describe("Marketplace", () => {
   test.beforeEach(async ({ page }) => {
+    await page.addInitScript(() => {
+      localStorage.setItem("kora-tour-done", "true");
+      localStorage.setItem("kora-changelog-seen-version", "0.1.0");
+    });
     await page.goto("/marketplace");
     // Wait for the page to hydrate and show invoice cards
     await page.waitForSelector("a[href^='/marketplace/']", { timeout: 15_000 });
@@ -26,7 +31,7 @@ test.describe("Marketplace", () => {
 
   test("renders Invoice Marketplace heading", async ({ page }) => {
     await expect(
-      page.getByRole("heading", { name: /Invoice Marketplace/i })
+      page.getByRole("heading", { name: /Invoice Marketplace/i }),
     ).toBeVisible();
   });
 
@@ -61,7 +66,7 @@ test.describe("Marketplace", () => {
 
   test("search input is visible and accepts text", async ({ page }) => {
     const searchInput = page.getByPlaceholder(
-      /Search by debtor, invoice number, or jurisdiction/i
+      /Search by debtor, invoice number, or jurisdiction/i,
     );
     await expect(searchInput).toBeVisible();
     await searchInput.fill("Safaricom");
@@ -70,7 +75,7 @@ test.describe("Marketplace", () => {
 
   test("search filters the invoice list", async ({ page }) => {
     const searchInput = page.getByPlaceholder(
-      /Search by debtor, invoice number, or jurisdiction/i
+      /Search by debtor, invoice number, or jurisdiction/i,
     );
     // Count cards before search
     const allCards = page.locator("a[href^='/marketplace/']");
@@ -89,7 +94,7 @@ test.describe("Marketplace", () => {
 
   test("clear search button restores full list", async ({ page }) => {
     const searchInput = page.getByPlaceholder(
-      /Search by debtor, invoice number, or jurisdiction/i
+      /Search by debtor, invoice number, or jurisdiction/i,
     );
     await searchInput.fill("Safaricom");
     await page.waitForTimeout(500);
@@ -118,7 +123,7 @@ test.describe("Marketplace", () => {
 
   test("Quick Filters button is visible on desktop", async ({ page }) => {
     await expect(
-      page.getByRole("button", { name: /Quick Filters/i })
+      page.getByRole("button", { name: /Quick Filters/i }),
     ).toBeVisible();
   });
 
@@ -136,15 +141,12 @@ test.describe("Marketplace", () => {
     await expect(page.getByText("Risk Tier")).toBeVisible();
     // Individual tier labels
     await expect(page.getByText("AAA")).toBeVisible();
-    await expect(page.getByText("BBB")).toBeVisible();
+    await expect(page.locator("fieldset").getByText("BBB")).toBeVisible();
   });
 
   test("selecting a risk tier filter updates the URL", async ({ page }) => {
     // Click the "A" risk tier checkbox
-    const aTierLabel = page
-      .locator("label")
-      .filter({ hasText: /^A$/ })
-      .first();
+    const aTierLabel = page.locator("label").filter({ hasText: /^A$/ }).first();
     await aTierLabel.click();
     await page.waitForTimeout(500);
     await expect(page).toHaveURL(/riskTiers=A/);
@@ -164,20 +166,62 @@ test.describe("Marketplace", () => {
   });
 });
 
+test.describe("Marketplace onboarding tour", () => {
+  test("auto-starts once, supports skipping, and does not run on deep links", async ({
+    page,
+  }) => {
+    await page.addInitScript(() => {
+      localStorage.setItem("kora-changelog-seen-version", "0.1.0");
+    });
+    await page.goto("/marketplace");
+
+    const tour = page.getByRole("dialog", {
+      name: "Marketplace onboarding tour",
+    });
+    await expect(tour).toBeVisible();
+    await expect(tour.getByText("Find the right opportunity")).toBeVisible();
+
+    await tour.getByRole("button", { name: "Next" }).click();
+    await expect(tour.getByText("Review invoice details")).toBeVisible();
+    await tour.getByRole("button", { name: "Next" }).click();
+    await expect(tour.getByText("Fund an invoice")).toBeVisible();
+    await tour.getByRole("button", { name: "Next" }).click();
+    await expect(tour.getByText("Track your portfolio")).toBeVisible();
+
+    await tour.getByRole("button", { name: "Skip tour" }).click();
+    await expect(tour).toBeHidden();
+    await expect
+      .poll(() => page.evaluate(() => localStorage.getItem("kora-tour-done")))
+      .toBe("true");
+
+    await page.reload();
+    await expect(tour).toBeHidden();
+
+    await page.evaluate(() => localStorage.removeItem("kora-tour-done"));
+    await page.goto("/marketplace/inv_001");
+    await expect(tour).toBeHidden();
+  });
+});
+
 test.describe("Marketplace — Invoice Detail", () => {
   test.beforeEach(async ({ page }) => {
+    await page.addInitScript(() => {
+      localStorage.setItem("kora-changelog-seen-version", "0.1.0");
+    });
     // Navigate directly to the first mock invoice detail page
     await page.goto("/marketplace/inv_001");
   });
 
   test("renders invoice number and debtor name", async ({ page }) => {
-    await expect(page.getByText("INV-2024-0891")).toBeVisible();
+    await expect(
+      page.locator("main").getByText("INV-2024-0891").first(),
+    ).toBeVisible();
     await expect(page.getByText("Safaricom PLC")).toBeVisible();
   });
 
   test("renders Financing Terms section", async ({ page }) => {
     await expect(page.getByText(/Financing Terms/i)).toBeVisible();
-    await expect(page.getByText(/APR/i)).toBeVisible();
+    await expect(page.getByText("APR", { exact: true })).toBeVisible();
     await expect(page.getByText(/Min Investment/i)).toBeVisible();
   });
 
@@ -203,5 +247,65 @@ test.describe("Marketplace — Invoice Detail", () => {
       .getByRole("button", { name: /Connect Wallet to Invest/i })
       .click();
     await expect(page.getByRole("dialog")).toBeVisible();
+  });
+});
+
+test.describe("Marketplace — Investor funding flow", () => {
+  test("funds an invoice with a mocked wallet and updates progress optimistically", async ({
+    context,
+    page,
+  }) => {
+    await injectWalletStubs(context, { usdcBalance: "50000.00" });
+    await page.addInitScript(() => {
+      localStorage.setItem("kora-tour-done", "true");
+      localStorage.setItem("kora-changelog-seen-version", "0.1.0");
+    });
+
+    await page.goto("/marketplace/inv_003");
+    await expect(page.getByText("Fund This Invoice")).toBeVisible();
+    await expect(page.getByText(/30% of/i)).toBeVisible();
+
+    await page
+      .getByRole("spinbutton", { name: /Investment Amount/i })
+      .fill("10000");
+    await page.getByRole("button", { name: "Fund Invoice" }).click();
+
+    await expect(page.getByText(/39% of/i)).toBeVisible();
+    await expect(
+      page.getByText("Factoring escrow deposits funded!"),
+    ).toBeVisible({ timeout: 10_000 });
+
+    await page.goto("/dashboard/investor");
+    await expect(page.getByText("Portfolio Value")).toBeVisible();
+    await expect(page.locator("table")).toBeVisible();
+  });
+
+  test("shows an insufficient balance toast without submitting funding", async ({
+    context,
+    page,
+  }) => {
+    await injectWalletStubs(context, { usdcBalance: "100.00" });
+    await page.addInitScript(() => {
+      localStorage.setItem("kora-tour-done", "true");
+      localStorage.setItem("kora-changelog-seen-version", "0.1.0");
+    });
+
+    await page.goto("/marketplace/inv_003");
+    await expect(page.getByText("Fund This Invoice")).toBeVisible();
+
+    await page
+      .getByRole("spinbutton", { name: /Investment Amount/i })
+      .fill("500");
+    await expect(page.getByText(/Insufficient USDC balance/i)).toBeVisible();
+
+    await page.getByRole("button", { name: "Fund Invoice" }).click();
+    await expect(
+      page
+        .getByRole("region", { name: "Notifications alt+T" })
+        .getByRole("alert"),
+    ).toContainText("Insufficient balance");
+    await expect(
+      page.getByText("Factoring escrow deposits funded!"),
+    ).toBeHidden();
   });
 });

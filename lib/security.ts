@@ -1,6 +1,121 @@
 /**
- * Security utilities: XSS prevention, URL validation, input sanitization.
+ * Security utilities: XSS prevention, URL validation, input sanitization,
+ * and Stellar wallet-based upload request signing (Issue #275).
  */
+import { isValidCID } from "./ipfs";
+
+// ─── Upload Request Signing (#275) ────────────────────────────────────────────
+
+const CHALLENGE_TTL_MS = 5 * 60 * 1000; // 5 minutes anti-replay window
+
+/**
+ * Builds the challenge string that the wallet must sign.
+ * Format: "kora-upload:{walletAddress}:{timestamp}"
+ *
+ * The timestamp is in milliseconds and is embedded so the server can
+ * reject replayed tokens older than CHALLENGE_TTL_MS.
+ */
+export function buildUploadChallenge(walletAddress: string, timestamp: number): string {
+  return `kora-upload:${walletAddress}:${timestamp}`;
+}
+
+/**
+ * Signs an upload challenge using the Stellar Wallets Kit sign method.
+ * Returns the hex-encoded signature string to be sent as a Bearer token.
+ *
+ * Usage (client-side):
+ *   const token = await signUploadChallenge(walletAddress, (msg) =>
+ *     walletKit.signMessage({ message: msg, address: walletAddress })
+ *   );
+ *   // Attach as: Authorization: Bearer <token>
+ */
+export async function signUploadChallenge(
+  walletAddress: string,
+  sign: (message: string) => Promise<{ signedMessage: string } | string>
+): Promise<string> {
+  const timestamp = Date.now();
+  const challenge = buildUploadChallenge(walletAddress, timestamp);
+  const result = await sign(challenge);
+  const signedMessage = typeof result === "string" ? result : result.signedMessage;
+  // Encode as base64url: "<walletAddress>.<timestamp>.<signature>"
+  return btoa(`${walletAddress}.${timestamp}.${signedMessage}`);
+}
+
+/**
+ * Verifies an upload Bearer token on the server.
+ * Returns { ok: true, walletAddress } or { ok: false, error }.
+ *
+ * Verification steps:
+ * 1. Decode the base64 token → walletAddress, timestamp, signature
+ * 2. Reject if timestamp is older than CHALLENGE_TTL_MS (anti-replay)
+ * 3. Verify the ed25519 signature against the challenge using @stellar/stellar-sdk
+ */
+export function verifyUploadToken(
+  token: string
+): { ok: true; walletAddress: string } | { ok: false; error: string } {
+  try {
+    const decoded = Buffer.from(token, "base64").toString("utf8");
+    const firstDot = decoded.indexOf(".");
+    const lastDot = decoded.lastIndexOf(".");
+    if (firstDot === -1 || firstDot === lastDot) {
+      return { ok: false, error: "Malformed token" };
+    }
+
+    const walletAddress = decoded.slice(0, firstDot);
+    const timestampStr = decoded.slice(firstDot + 1, lastDot);
+    const signature = decoded.slice(lastDot + 1);
+
+    const timestamp = parseInt(timestampStr, 10);
+    if (isNaN(timestamp)) return { ok: false, error: "Invalid timestamp" };
+
+    // Anti-replay: reject tokens older than TTL
+    if (Date.now() - timestamp > CHALLENGE_TTL_MS) {
+      return { ok: false, error: "Token expired" };
+    }
+
+    // Validate Stellar public key format
+    if (!/^G[A-Z2-7]{55}$/.test(walletAddress)) {
+      return { ok: false, error: "Invalid wallet address" };
+    }
+
+    const challenge = buildUploadChallenge(walletAddress, timestamp);
+
+    // Verify ed25519 signature using @stellar/stellar-sdk
+    // eslint-disable-next-line
+    const { Keypair } = require("@stellar/stellar-sdk") as typeof import("@stellar/stellar-sdk");
+    const keypair = Keypair.fromPublicKey(walletAddress);
+    const msgBuffer = Buffer.from(challenge, "utf8");
+    const sigBuffer = Buffer.from(signature, "hex");
+
+    if (!keypair.verify(msgBuffer, sigBuffer)) {
+      return { ok: false, error: "Invalid signature" };
+    }
+
+    return { ok: true, walletAddress };
+  } catch {
+    return { ok: false, error: "Token verification failed" };
+  }
+}
+
+// ─── General Input Sanitization ──────────────────────────────────────────────
+
+const MAX_INPUT_LENGTH = 2048;
+
+/**
+ * Sanitize a user-supplied string input: strips HTML tags, removes control
+ * characters, and enforces a maximum length.
+ *
+ * Use this on every user-supplied string before storing or rendering it.
+ * For rendering untrusted HTML blobs, use sanitizeHtml() instead.
+ */
+export function sanitizeInput(value: string | undefined | null, maxLength = MAX_INPUT_LENGTH): string {
+  if (!value) return "";
+  return value
+    .replace(/<[^>]*>/g, "")       // strip HTML tags
+    .replace(/[^\x20-\x7E -￿]/g, "") // remove control chars
+    .slice(0, maxLength)
+    .trim();
+}
 
 // ─── HTML Sanitization ────────────────────────────────────────────────────────
 
@@ -68,12 +183,11 @@ export function safeExternalUrl(url: string | undefined | null): string {
 
 /**
  * Builds a safe IPFS gateway URL from a CID.
- * Validates the CID contains only alphanumeric chars and allowed IPFS chars.
+ * Validates the CID format (v0/v1) before constructing the URL.
  */
 export function safeIpfsUrl(cid: string | undefined | null, gateway?: string): string {
   if (!cid) return "#";
-  // IPFS CIDs: base58 (v0) or base32 (v1) — alphanumeric + limited punctuation
-  if (!/^[a-zA-Z0-9+/=_-]{10,100}$/.test(cid)) return "#";
+  if (!isValidCID(cid)) return "#";
   const gw = gateway || "https://gateway.pinata.cloud/ipfs";
   return `${gw}/${cid}`;
 }

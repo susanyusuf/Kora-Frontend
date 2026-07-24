@@ -4,7 +4,7 @@ import { useState, useCallback, useEffect, useMemo } from "react";
 import Link from "next/link";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
-import { useDropzone } from "react-dropzone";
+import { type FileRejection, useDropzone } from "react-dropzone";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   FileText,
@@ -12,12 +12,17 @@ import {
   ArrowRight,
   ArrowLeft,
   AlertCircle,
+  WifiOff,
+  RefreshCw,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input, Textarea, NumberInput, DatePicker, FileInput, Select } from "@/components/ui";
 import { GlassCard } from "@/components/ui/card";
 import { useWallet } from "@/hooks/useWallet";
+import { useWalletStore } from "@/store";
 import { useTransaction } from "@/hooks/useTransaction";
+import { useTxSimulation } from "@/hooks/useTxSimulation";
+import { TxSimulationPreview } from "@/components/invoice/TxSimulationPreview";
 import { useUIStore, useInvoiceStore } from "@/store";
 import { prepareCreateInvoice } from "@/services/invoiceService";
 import {
@@ -28,9 +33,10 @@ import {
   FINANCING_TERMS_STEP_FIELDS,
   type CreateInvoiceSchema,
 } from "@/lib/validations/invoice";
-import { cn } from "@/lib/utils";
+import { cn, isValidStellarAddress } from "@/lib/utils";
 import { safeStellarTxUrl } from "@/lib/security";
 import { ErrorBoundary } from "@/components/ui/error-boundary";
+import { usePinataHealth } from "@/hooks/usePinataHealth";
 
 const TODAY = new Date().toISOString().split("T")[0];
 
@@ -60,6 +66,12 @@ const CATEGORY_OPTIONS = [
   { value: "other", label: "Other" },
 ];
 
+const PRIVACY_OPTIONS = [
+  { value: "full", label: "Full (Name + Address)" },
+  { value: "partial", label: "Partial (Name Only)" },
+  { value: "anonymized", label: "Anonymized (Industry + Country)" },
+];
+
 export default function CreateInvoicePage() {
   const [step, setStep] = useState(0);
   const [file, setFile] = useState<File | null>(null);
@@ -68,6 +80,7 @@ export default function CreateInvoicePage() {
   const { setWalletModalOpen } = useUIStore();
   const { createDraft, setCreateDraft, clearCreateDraft } = useInvoiceStore();
   const { execute, status: txStatus, error: txError, reset: resetTxState } = useTransaction();
+  const { simulationDialogProps, onSimulationPreview } = useTxSimulation();
 
   const [fileError, setFileError] = useState<string | null>(null);
   const [uploadProgress, setUploadProgress] = useState(0);
@@ -77,6 +90,9 @@ export default function CreateInvoicePage() {
     txHash: string;
     metadataCid: string;
   } | null>(null);
+
+  // Pinata health — checked when the user reaches the Upload step
+  const { isHealthy: pinataHealthy, isChecking: pinataChecking, status: pinataStatus, recheck: recheckPinata } = usePinataHealth();
 
   const {
     register,
@@ -95,6 +111,7 @@ export default function CreateInvoicePage() {
       issueDate: TODAY,
       jurisdiction: "KE",
       category: "technology",
+      debtorPrivacy: "full",
       ...createDraft,
     },
   });
@@ -157,7 +174,7 @@ export default function CreateInvoicePage() {
     return (d / (1 - d)) * (365 / daysToMaturity) * 100;
   }, [discountRateVal, daysToMaturity]);
 
-  const onDrop = useCallback((acceptedFiles: File[], fileRejections: any[]) => {
+  const onDrop = useCallback((acceptedFiles: File[], fileRejections: FileRejection[]) => {
     setFileError(null);
     if (acceptedFiles[0]) {
       setFile(acceptedFiles[0]);
@@ -236,6 +253,7 @@ export default function CreateInvoicePage() {
       },
       {
         successMessage: "Invoice minted on Soroban!",
+        onSimulationPreview,
         onSuccess: (hash) => {
           const mockTokenId = Math.floor(1001 + Math.random() * 8999).toString();
           setMintedInfo({
@@ -326,45 +344,46 @@ export default function CreateInvoicePage() {
   }
 
   return (
-    <ErrorBoundary>
-    <div className="mx-auto max-w-2xl px-4 py-10 sm:px-6">
-      <div className="mb-8">
-        <h1 className="text-2xl font-bold text-zinc-100">Create Invoice</h1>
-        <p className="mt-1 text-sm text-zinc-500">
-          Tokenize your invoice and access instant liquidity
-        </p>
-      </div>
-
-      {/* Step indicator */}
-      <div className="mb-8 flex items-center gap-2">
-        {STEPS.map((label, i) => (
-          <div key={label} className="flex items-center gap-2">
-            <div
-              className={cn(
-                "flex h-7 w-7 items-center justify-center rounded-full text-xs font-semibold transition-colors",
-                i < step
-                  ? "bg-kora-500 text-white"
-                  : i === step
-                    ? "border-kora-500 text-kora-400 border-2"
-                    : "border border-zinc-700 text-zinc-600"
-              )}
-            >
-              {i < step ? <CheckCircle2 className="h-4 w-4" /> : i + 1}
-            </div>
-            <span
-              className={cn(
-                "hidden text-xs sm:block",
-                i === step ? "text-zinc-300" : "text-zinc-600"
-              )}
-            >
-              {label}
-            </span>
-            {i < STEPS.length - 1 && <div className="h-px w-8 bg-zinc-800" />}
+    <>
+      <ErrorBoundary>
+        <div className="mx-auto max-w-2xl px-4 py-10 sm:px-6">
+          <div className="mb-8">
+            <h1 className="text-2xl font-bold text-zinc-100">Create Invoice</h1>
+            <p className="mt-1 text-sm text-zinc-500">
+              Tokenize your invoice and access instant liquidity
+            </p>
           </div>
-        ))}
-      </div>
 
-      <form onSubmit={handleSubmit(onSubmit)}>
+          {/* Step indicator */}
+          <div className="mb-8 flex items-center gap-2">
+            {STEPS.map((label, i) => (
+              <div key={label} className="flex items-center gap-2">
+                  <div
+                    className={cn(
+                      "flex h-7 w-7 items-center justify-center rounded-full text-xs font-semibold transition-colors",
+                      i < step
+                        ? "bg-kora-500 text-white"
+                        : i === step
+                          ? "border-kora-500 text-kora-400 border-2"
+                          : "border border-zinc-700 text-zinc-600"
+                    )}
+                  >
+                    {i < step ? <CheckCircle2 className="h-4 w-4" /> : i + 1}
+                  </div>
+                  <span
+                    className={cn(
+                      "hidden text-xs sm:block",
+                      i === step ? "text-zinc-300" : "text-zinc-600"
+                    )}
+                  >
+                    {label}
+                  </span>
+                  {i < STEPS.length - 1 && <div className="h-px w-8 bg-zinc-800" />}
+                </div>
+              ))}
+            </div>
+
+            <form onSubmit={handleSubmit(onSubmit)}>
         <AnimatePresence mode="wait">
           {/* ── Step 0: Invoice Details ─────────────────────────────────── */}
           {step === 0 && (
@@ -381,32 +400,60 @@ export default function CreateInvoicePage() {
                 <Input
                   label="Invoice Number"
                   placeholder="INV-2024-0001"
+                  aria-required="true"
                   error={errors.invoiceNumber?.message}
                   {...register("invoiceNumber")}
                 />
                 <Input
                   label="Debtor Company Name"
                   placeholder="Acme Corporation Ltd"
+                  aria-required="true"
                   error={errors.debtorName?.message}
                   {...register("debtorName")}
                 />
-                <Input
-                  label="Debtor Address"
-                  placeholder="123 Business St, City, Country"
-                  error={errors.debtorAddress?.message}
-                  {...register("debtorAddress")}
-                />
+                <div>
+                  <Input
+                    label="Debtor Address"
+                    placeholder="123 Business St, City, Country"
+                    aria-required="true"
+                    error={errors.debtorAddress?.message}
+                    list="address-book-list"
+                    {...register("debtorAddress")}
+                  />
+                  <datalist id="address-book-list">
+                    {useWalletStore.getState().addressBook.map((e) => (
+                      <option key={e.id} value={e.address}>{e.label || e.address}</option>
+                    ))}
+                  </datalist>
+                  <div className="mt-2 flex gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const val = (document.querySelector('input[name="debtorAddress"]') as HTMLInputElement)?.value;
+                        if (!val) return alert("No address to save");
+                        if (!isValidStellarAddress(val)) return alert("Invalid Stellar address format");
+                        useWalletStore.getState().addAddressBookEntry(val, "");
+                        alert("Saved to address book");
+                      }}
+                      className="rounded-lg px-3 py-1 text-sm"
+                    >
+                      + Add to Address Book
+                    </button>
+                  </div>
+                </div>
                 <div className="grid gap-4 sm:grid-cols-2">
                   <NumberInput
                     label="Invoice Amount (USDC)"
                     placeholder="50000"
                     hint="Minimum 100 USDC"
+                    aria-required="true"
                     error={errors.amount?.message}
                     success={!!watch("amount") && !errors.amount}
                     {...register("amount")}
                   />
                   <DatePicker
                     label="Due Date"
+                    aria-required="true"
                     error={errors.dueDate?.message}
                     success={!!watch("dueDate") && !errors.dueDate}
                     min={TODAY}
@@ -426,16 +473,26 @@ export default function CreateInvoicePage() {
                   <Select
                     label="Jurisdiction"
                     options={JURISDICTION_OPTIONS}
+                    aria-required="true"
                     error={errors.jurisdiction?.message}
                     {...register("jurisdiction")}
                   />
                   <Select
                     label="Industry Category"
                     options={CATEGORY_OPTIONS}
+                    aria-required="true"
                     error={errors.category?.message}
                     {...register("category")}
                   />
                 </div>
+
+                <Select
+                  label="Debtor Privacy Level"
+                  options={PRIVACY_OPTIONS}
+                  aria-required="true"
+                  error={errors.debtorPrivacy?.message}
+                  {...register("debtorPrivacy")}
+                />
 
                 <div className="rounded-2xl border border-zinc-800/70 bg-zinc-950/70 p-5 shadow-inner shadow-zinc-950/20">
                   <div className="flex items-center justify-between border-b border-zinc-800/60 pb-3">
@@ -516,6 +573,7 @@ export default function CreateInvoicePage() {
                       <Input
                         id="discount-rate-input"
                         aria-labelledby="discount-rate-label"
+                        aria-required="true"
                         type="number"
                         step="0.1"
                         min="0.5"
@@ -536,7 +594,9 @@ export default function CreateInvoicePage() {
                   <div className="flex items-center gap-4 rounded-lg border border-zinc-800/40 bg-zinc-900/40 px-3 py-2">
                     <span className="font-mono text-xs text-zinc-500">0.5%</span>
                     <input
+                      id="discount-rate-range"
                       type="range"
+                      aria-labelledby="discount-rate-label"
                       min="0.5"
                       max="20"
                       step="0.1"
@@ -564,6 +624,7 @@ export default function CreateInvoicePage() {
                     label="Minimum Investment (USDC)"
                     placeholder="1000"
                     hint="Smallest amount a single investor can contribute"
+                    aria-required="true"
                     error={errors.minInvestment?.message}
                     success={!!watch("minInvestment") && !errors.minInvestment}
                     {...register("minInvestment")}
@@ -575,6 +636,7 @@ export default function CreateInvoicePage() {
                     max={maxExpiryDate}
                     placeholder="Select expiry date..."
                     hint="When the listing period closes"
+                    aria-required="true"
                     error={errors.listingExpiryDate?.message}
                     success={!!watch("listingExpiryDate") && !errors.listingExpiryDate}
                     {...register("listingExpiryDate")}
@@ -696,6 +758,40 @@ export default function CreateInvoicePage() {
               exit={{ opacity: 0, x: -20 }}
               className="space-y-4"
             >
+              {/* Pinata unavailability banner */}
+              {!pinataChecking && pinataStatus === "unhealthy" && (
+                <motion.div
+                  initial={{ opacity: 0, y: -8 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  className="flex items-start gap-3 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-300"
+                  role="alert"
+                  data-testid="pinata-unavailable-banner"
+                >
+                  <WifiOff className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
+                  <div className="flex-1 min-w-0">
+                    <p className="font-semibold">IPFS storage is temporarily unavailable.</p>
+                    <p className="mt-0.5 text-xs text-amber-400/80">
+                      Your invoice cannot be minted right now. All your form data has been saved — you can try again when the service recovers.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={recheckPinata}
+                    className="shrink-0 rounded-lg p-1 text-amber-400 transition-colors hover:bg-amber-500/20"
+                    aria-label="Retry health check"
+                  >
+                    <RefreshCw className="h-3.5 w-3.5" />
+                  </button>
+                </motion.div>
+              )}
+
+              {pinataChecking && (
+                <div className="flex items-center gap-2 rounded-xl border border-zinc-800 bg-zinc-900/60 px-4 py-3 text-xs text-zinc-400" aria-live="polite">
+                  <span className="h-1.5 w-1.5 animate-ping rounded-full bg-zinc-400" aria-hidden="true" />
+                  Checking IPFS storage availability…
+                </div>
+              )}
+
               <GlassCard className="space-y-4 p-6">
                 <div>
                   <p className="mb-2 text-sm font-medium text-zinc-300">Invoice Document</p>
@@ -723,13 +819,15 @@ export default function CreateInvoicePage() {
                     </div>
                   ) : (
                     <FileInput
+                      label="Invoice Document"
                       value={file}
-                      onChange={(e: any) => {
-                        setFile(e.target.value);
+                      onChange={(e) => {
+                        setFile(e.target.files?.[0] ?? null);
                         setFileError(null);
                       }}
+                      aria-required="true"
                       error={fileError || undefined}
-                      disabled={isUploading}
+                      disabled={isUploading || pinataStatus === "unhealthy"}
                     />
                   )}
                 </div>
@@ -818,8 +916,9 @@ export default function CreateInvoicePage() {
           ) : (
             <Button
               type="submit"
-              disabled={!file || !isConnected || isUploading || txStatus === "signing" || txStatus === "submitting" || txStatus === "polling"}
+              disabled={!file || !isConnected || isUploading || pinataStatus === "unhealthy" || pinataChecking || txStatus === "signing" || txStatus === "submitting" || txStatus === "polling"}
               onClick={!isConnected ? () => setWalletModalOpen(true) : undefined}
+              title={pinataStatus === "unhealthy" ? "IPFS storage is temporarily unavailable" : undefined}
             >
               {!isConnected ? "Connect Wallet" : "Mint Invoice NFT"}
             </Button>
@@ -887,6 +986,10 @@ export default function CreateInvoicePage() {
         </div>
       )}
     </div>
-    </ErrorBoundary>
+      </ErrorBoundary>
+
+      {/* Transaction simulation preview dialog — rendered outside the form */}
+      <TxSimulationPreview {...simulationDialogProps} />
+    </>
   );
 }

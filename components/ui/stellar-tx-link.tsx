@@ -29,9 +29,10 @@ export function StellarTxLink({
   showIcon = true,
 }: StellarTxLinkProps) {
   if (!hash) return null;
+  const href = safeStellarTxUrl(hash);
+  if (href === "#") return null;
 
   const truncated = truncateAddress(hash, chars);
-  const href = safeStellarTxUrl(hash);
 
   return (
     <Tooltip.Provider delayDuration={200}>
@@ -41,6 +42,7 @@ export function StellarTxLink({
             href={href}
             target="_blank"
             rel="noopener noreferrer"
+            aria-label={`View transaction ${hash} on Stellar Expert`}
             className={cn(
               "inline-flex items-center gap-1 font-mono text-kora-400 hover:text-kora-300 transition-colors",
               sizeClasses[size],
