@@ -1,10 +1,32 @@
-/**
- * Vitest setup file for integration tests
- * Configures jsdom environment, mocks, and global test utilities
- */
+// Set mock environment variables before any other imports to pass schema validation
+process.env.NEXT_PUBLIC_STELLAR_NETWORK = "testnet";
+process.env.NEXT_PUBLIC_STELLAR_RPC_URL = "https://soroban-testnet.stellar.org";
+process.env.NEXT_PUBLIC_STELLAR_HORIZON_URL = "https://horizon-testnet.stellar.org";
+process.env.NEXT_PUBLIC_STELLAR_NETWORK_PASSPHRASE = "Test SDF Network ; September 2015";
+process.env.NEXT_PUBLIC_INVOICE_CONTRACT_ID = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
+process.env.NEXT_PUBLIC_MARKETPLACE_CONTRACT_ID = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
+process.env.NEXT_PUBLIC_TOKEN_CONTRACT_ID = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
+process.env.NEXT_PUBLIC_IPFS_GATEWAY = "https://gateway.pinata.cloud/ipfs";
+process.env.PINATA_JWT = "mock_jwt";
 
+import React from "react";
 import { expect, afterEach, vi } from "vitest";
 import { cleanup } from "@testing-library/react";
+
+// Mock missing jspdf virtual module for export utilities
+vi.mock("jspdf", () => ({
+  default: class {
+    internal = {
+      pageSize: {
+        getWidth: () => 210,
+        getHeight: () => 297,
+      },
+    };
+    addImage() {}
+    addPage() {}
+    save() {}
+  },
+}));
 
 // Cleanup after each test
 afterEach(() => {
@@ -38,11 +60,18 @@ global.IntersectionObserver = class IntersectionObserver {
   unobserve() {}
 } as any;
 
+// Mock ResizeObserver
+global.ResizeObserver = class ResizeObserver {
+  constructor() {}
+  observe() {}
+  unobserve() {}
+  disconnect() {}
+};
+
 // Mock next/image
 vi.mock("next/image", () => ({
   default: (props: any) => {
-    // eslint-disable-next-line jsx-a11y/alt-text
-    return <img {...props} />;
+    return React.createElement("img", props);
   },
 }));
 
@@ -56,71 +85,26 @@ vi.mock("sonner", () => ({
   },
 }));
 
-// Add custom matchers if needed
-expect.extend({});
-import "@testing-library/jest-dom";
-import { afterEach, beforeAll, afterAll, vi } from "vitest";
-import { cleanup } from "@testing-library/react";
-import { server } from "./app/invoice/__tests__/mocks/server";
+import * as matchers from "@testing-library/jest-dom/matchers";
+expect.extend(matchers);
 
-// Clean up after each test
-afterEach(() => {
-  cleanup();
-});
+vi.mock("next-intl", () => ({
+  useTranslations: () => (key: string, values?: Record<string, unknown>) => {
+    if (!values) return key;
+    return key.replace(/\{(.*?)\}/g, (_, group) => String(values[group] ?? `{${group}}`));
+  },
+}));
 
-// Start MSW server before all tests
-beforeAll(() => server.listen({ onUnhandledRequest: "warn" }));
-afterEach(() => server.resetHandlers());
-afterAll(() => server.close());
-
-// ── Global browser API stubs ──────────────────────────────────────────────────
-
-// next/navigation
 vi.mock("next/navigation", () => ({
-  useRouter: () => ({ push: vi.fn(), replace: vi.fn(), back: vi.fn() }),
-  usePathname: () => "/invoice/create",
+  useRouter: () => ({
+    push: vi.fn(),
+    replace: vi.fn(),
+    prefetch: vi.fn(),
+    back: vi.fn(),
+    forward: vi.fn(),
+    refresh: vi.fn(),
+  }),
+  usePathname: () => "/",
   useSearchParams: () => new URLSearchParams(),
+  useParams: () => ({}),
 }));
-
-// next/link — render as plain anchor (no JSX in .ts file; use createElement)
-vi.mock("next/link", () => ({
-  default: ({ href, children, ...rest }: any) => {
-    const React = require("react");
-    return React.createElement("a", { href, ...rest }, children);
-  },
-}));
-
-// framer-motion — passthrough to avoid animation complexity in tests
-vi.mock("framer-motion", async () => {
-  const actual = await vi.importActual<typeof import("framer-motion")>("framer-motion");
-  const React = require("react");
-  return {
-    ...actual,
-    motion: new Proxy(
-      {},
-      {
-        get: (_t: any, tag: string) =>
-          ({ children, ...props }: any) =>
-            React.createElement(tag, props, children),
-      }
-    ),
-    AnimatePresence: ({ children }: any) => children,
-  };
-});
-
-// sonner toast — no-op
-vi.mock("sonner", () => ({
-  toast: {
-    loading: vi.fn(),
-    success: vi.fn(),
-    error: vi.fn(),
-  },
-}));
-
-// URL.createObjectURL — not available in jsdom
-if (typeof URL.createObjectURL === "undefined") {
-  Object.defineProperty(URL, "createObjectURL", {
-    value: vi.fn(() => "blob:mock-url"),
-    writable: true,
-  });
-}

@@ -1,19 +1,109 @@
 /**
  * IPFS upload service via Pinata.
  * Supports XHR progress tracking, CID validation, and retry on 5xx errors.
+ *
+ * All metadata uploads are validated against InvoiceMetadataV1 schema before
+ * being pinned to IPFS. An SVG invoice preview is generated and uploaded as
+ * the NFT image field.
  */
 import type { InvoiceMetadata } from "@/types";
 import { withRetry } from "@/lib/utils";
 import { env } from "@/lib/env";
+import {
+  buildInvoiceMetadata,
+  validateInvoiceMetadata,
+  METADATA_VERSION,
+  type InvoiceMetadataV1,
+  type InvoiceMetadataV1Input,
+} from "@/lib/invoiceMetadata";
+import { generateInvoiceSvg, svgToFile } from "@/lib/invoiceSvg";
 
 const IPFS_GATEWAY = env.NEXT_PUBLIC_IPFS_GATEWAY;
 
 // CID v0 (Qm...) or CID v1 (bafy...)
 const CID_REGEX = /^(Qm[1-9A-HJ-NP-Za-km-z]{44}|bafy[a-z2-7]{52,})$/;
 
+// ─── Pinata Health Check ──────────────────────────────────────────────────────
+
+const HEALTH_CACHE_TTL = 60_000; // 60 seconds
+const HEALTH_TIMEOUT_MS = 3_000; // 3 seconds
+
+interface HealthCacheEntry {
+  healthy: boolean;
+  checkedAt: number;
+}
+
+let _healthCache: HealthCacheEntry | null = null;
+
+/**
+ * Ping the Pinata health endpoint.
+ * Result is cached for 60 s to avoid hammering Pinata.
+ * Times out in < 3 s to avoid blocking the UI.
+ *
+ * @returns true  — Pinata is reachable and healthy
+ * @returns false — Pinata is down, unreachable, or timed out
+ */
+export async function checkPinataHealth(): Promise<boolean> {
+  const now = Date.now();
+  if (_healthCache && now - _healthCache.checkedAt < HEALTH_CACHE_TTL) {
+    return _healthCache.healthy;
+  }
+
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), HEALTH_TIMEOUT_MS);
+
+    const res = await fetch("https://api.pinata.cloud/data/testAuthentication", {
+      method: "GET",
+      signal: controller.signal,
+      // No auth needed — this endpoint returns 401 even without a JWT,
+      // but a reachable 401 means Pinata is up. Only network errors / timeouts
+      // mean it's truly unavailable.
+    });
+
+    clearTimeout(timeoutId);
+
+    // Any HTTP response (including 401 Unauthorized) means the service is reachable.
+    const healthy = res.status < 500;
+    _healthCache = { healthy, checkedAt: Date.now() };
+    return healthy;
+  } catch {
+    // AbortError (timeout) or network error → treat as unhealthy
+    _healthCache = { healthy: false, checkedAt: Date.now() };
+    return false;
+  }
+}
+
+/**
+ * Invalidate the health cache (useful in tests or after a known outage).
+ */
+export function invalidatePinataHealthCache(): void {
+  _healthCache = null;
+}
+
+export function isValidCID(cid: string): boolean {
+  return CID_REGEX.test(cid);
+}
+
+export class InvalidCIDError extends Error {
+  constructor(cid: string) {
+    super(`Invalid IPFS CID: ${cid}`);
+    this.name = "InvalidCIDError";
+  }
+}
+
 export function validateCid(cid: string): void {
-  if (!CID_REGEX.test(cid)) {
-    throw new Error(`Invalid IPFS CID: ${cid}`);
+  if (!isValidCID(cid)) {
+    throw new InvalidCIDError(cid);
+  }
+}
+
+export const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
+
+export class FileSizeError extends Error {
+  constructor(size: number) {
+    super(`File size ${size} bytes exceeds the 10MB limit.`);
+    this.name = "FileSizeError";
   }
 }
 
@@ -57,6 +147,10 @@ export async function uploadInvoicePDF(
   walletAddress: string,
   onProgress?: (percent: number) => void
 ): Promise<string> {
+  if (file.size > MAX_FILE_SIZE) {
+    throw new FileSizeError(file.size);
+  }
+
   const form = new FormData();
   form.append("file", file);
   form.append("walletAddress", walletAddress);
@@ -112,7 +206,100 @@ export async function uploadInvoiceToIPFS(
 
 /** Build a public IPFS gateway URL from a CID. */
 export function ipfsUrl(cid: string): string {
+  validateCid(cid);
   return `${IPFS_GATEWAY}/${cid}`;
+}
+
+// ─── Validated V1 Metadata Upload ────────────────────────────────────────────
+
+/**
+ * Upload a validated InvoiceMetadataV1 object to IPFS.
+ *
+ * This is the canonical upload path for invoice NFT metadata. It:
+ *  1. Validates the metadata against the InvoiceMetadataV1 Zod schema
+ *  2. Generates an SVG invoice preview and uploads it as the NFT image
+ *  3. Injects the image CID into the metadata
+ *  4. Uploads the final metadata JSON to IPFS
+ *
+ * @param input         - Invoice metadata input (without metadata_version)
+ * @param walletAddress - Uploader's Stellar wallet address (for rate limiting)
+ * @param onProgress    - Optional progress callback (0–100)
+ * @returns Object containing the metadata CID and image CID
+ * @throws {Error} if schema validation fails or any upload step fails
+ */
+export async function uploadValidatedInvoiceMetadata(
+  input: InvoiceMetadataV1Input,
+  walletAddress: string,
+  onProgress?: (percent: number) => void
+): Promise<{ metadataCid: string; imageCid: string }> {
+  // Step 1: Pre-validate input (without image — we'll add it after upload)
+  const preCheck = validateInvoiceMetadata({
+    metadata_version: METADATA_VERSION,
+    ...input,
+    // Provide a placeholder image for pre-validation; real value set below
+    image: input.image ?? "ipfs://placeholder",
+  });
+  if (!preCheck.success) {
+    throw new Error(
+      `Invoice metadata validation failed:\n${preCheck.errors.join("\n")}`
+    );
+  }
+
+  onProgress?.(5);
+
+  // Step 2: Generate SVG invoice preview
+  // Build a temporary metadata object for SVG generation
+  const tempMeta = buildInvoiceMetadata({
+    ...input,
+    image: input.image ?? "ipfs://placeholder",
+  });
+  const svgString = generateInvoiceSvg(tempMeta);
+  const svgFile = svgToFile(
+    svgString,
+    `invoice-preview-${input.invoice_number}.svg`
+  );
+
+  onProgress?.(15);
+
+  // Step 3: Upload SVG to IPFS
+  const imageCid = await uploadInvoicePDF(svgFile, walletAddress, (p) => {
+    // Map SVG upload progress to 15–55% of total
+    onProgress?.(15 + Math.round(p * 0.4));
+  });
+
+  onProgress?.(55);
+
+  // Step 4: Build final validated metadata with real image CID
+  const finalMetadata = buildInvoiceMetadata({
+    ...input,
+    image: `ipfs://${imageCid}`,
+  });
+
+  onProgress?.(60);
+
+  // Step 5: Upload metadata JSON to IPFS
+  const metadataCid = await withRetry(
+    () =>
+      fetch(`/api/upload`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          walletAddress,
+          metadata: finalMetadata,
+          name: `invoice-metadata-v${METADATA_VERSION}-${input.invoice_number}`,
+        }),
+      }).then(async (r) => {
+        if (!r.ok) throw new Error(`Metadata upload failed: ${r.status}`);
+        const json = (await r.json()) as { cid: string };
+        return json.cid;
+      }),
+    3
+  );
+
+  validateCid(metadataCid);
+  onProgress?.(100);
+
+  return { metadataCid, imageCid };
 }
 
 /**

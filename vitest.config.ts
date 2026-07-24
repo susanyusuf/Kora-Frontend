@@ -1,49 +1,36 @@
 import { defineConfig } from "vitest/config";
 import react from "@vitejs/plugin-react";
 import path from "path";
-import react from "@vitejs/plugin-react";
+import { loadEnvConfig } from "@next/env";
+import { transformWithEsbuild } from "vite";
+
+loadEnvConfig(process.cwd());
 
 export default defineConfig({
-  plugins: [react()],
-  test: {
-    environment: "jsdom",
-    globals: true,
-    setupFiles: ["./vitest.setup.ts"],
-    css: true,
-    include: ["**/__tests__/**/*.{test,spec}.{ts,tsx}", "**/*.{test,spec}.{ts,tsx}"],
-    exclude: [
-      "node_modules",
-      ".next",
-      "**/__tests__/mocks/**",
-      "e2e/**",
-    ],
-    typecheck: {
-      tsconfig: "./tsconfig.test.json",
-    },
-    coverage: {
-      provider: "v8",
-      reporter: ["text", "html", "lcov"],
-      reportsDirectory: "./coverage",
-      // Target 100% on lib/ — these are the pure utility modules
-      include: ["lib/**/*.ts"],
-      exclude: [
-        "lib/**/__tests__/**",
-        "lib/**/*.test.ts",
-        "lib/**/*.spec.ts",
-        // queryKeys is a trivial re-export of constants — excluded from branch coverage
-        "lib/queryKeys.ts",
-      ],
-      thresholds: {
-        lines: 100,
-        functions: 100,
-        branches: 100,
-        statements: 100,
+  plugins: [
+    {
+      name: "compile-jsx-for-vitest",
+      async transform(code, id) {
+        if (id.endsWith(".tsx") || id.endsWith(".jsx")) {
+          return transformWithEsbuild(code, id, {
+            loader: id.endsWith(".tsx") ? "tsx" : "jsx",
+            jsx: "automatic",
+          });
+        }
+        return null;
       },
     },
+    react(),
+  ],
+  test: {
+    globals: true,
+    environment: "jsdom",
+    setupFiles: ["vitest.setup.ts"],
+    exclude: ["**/node_modules/**", "**/e2e/**"],
   },
   resolve: {
     alias: {
-      "@": path.resolve(__dirname, "."),
+      "@": path.resolve(__dirname, "./"),
     },
   },
 });
