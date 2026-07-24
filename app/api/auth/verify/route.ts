@@ -1,5 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import * as StellarSdk from "@stellar/stellar-sdk";
+import { logger } from "@/lib/logger";
+import { verifyCsrf } from "@/lib/csrf";
 
 interface VerifyRequest {
   challenge: string;
@@ -19,6 +21,10 @@ interface VerifyResponse {
  * Uses Stellar SDK to verify the signature.
  */
 export async function POST(request: NextRequest): Promise<NextResponse<VerifyResponse>> {
+  const csrfError = verifyCsrf(request);
+  if (csrfError) return csrfError as NextResponse<VerifyResponse>;
+
+  const requestId = request.headers.get("x-request-id") ?? crypto.randomUUID();
   try {
     const body = await request.json() as VerifyRequest;
     const { challenge, signature, publicKey } = body;
@@ -30,6 +36,7 @@ export async function POST(request: NextRequest): Promise<NextResponse<VerifyRes
           verified: false,
           expiresAt: 0,
           message: "Missing required fields: challenge, signature, publicKey",
+          requestId,
         },
         { status: 400 }
       );
@@ -48,16 +55,18 @@ export async function POST(request: NextRequest): Promise<NextResponse<VerifyRes
           verified: false,
           expiresAt: 0,
           message: "Signature verification failed",
+          requestId,
         });
       }
 
-      // Extract timestamp from challenge to validate freshness
-      const timestampMatch = challenge.match(/Timestamp: (\d+)/);
+      // Extract timestamp from challenge format: "Kora Protocol authentication: {timestamp}:{nonce}"
+      const timestampMatch = challenge.match(/^Kora Protocol authentication: (\d+):/);
       if (!timestampMatch) {
         return NextResponse.json({
           verified: false,
           expiresAt: 0,
           message: "Invalid challenge format",
+          requestId,
         });
       }
 
@@ -71,6 +80,7 @@ export async function POST(request: NextRequest): Promise<NextResponse<VerifyRes
           verified: false,
           expiresAt: 0,
           message: "Challenge expired",
+          requestId,
         });
       }
 
@@ -78,22 +88,20 @@ export async function POST(request: NextRequest): Promise<NextResponse<VerifyRes
       const SESSION_DURATION = 60 * 60 * 1000; // 1 hour
       const expiresAt = now + SESSION_DURATION;
 
-      return NextResponse.json({
-        verified: true,
-        expiresAt,
-      });
+      return NextResponse.json({ verified: true, expiresAt });
     } catch (verifyError) {
-      console.error("Verification error:", verifyError);
+      logger.error("Verification error", { requestId, route: "/api/auth/verify", error: verifyError });
       return NextResponse.json({
         verified: false,
         expiresAt: 0,
         message: "Failed to verify signature",
+        requestId,
       });
     }
   } catch (error) {
-    console.error("Error processing verify request:", error);
+    logger.error("Error processing verify request", { requestId, route: "/api/auth/verify", error });
     return NextResponse.json(
-      { verified: false, expiresAt: 0, message: "Internal server error" },
+      { verified: false, expiresAt: 0, message: "Internal server error", requestId },
       { status: 500 }
     );
   }

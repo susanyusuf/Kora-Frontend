@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback } from "react";
+import { useCallback, useEffect, useRef } from "react";
 import {
   StellarWalletsKit,
   WalletNetwork,
@@ -11,8 +11,17 @@ import {
   AlbedoModule,
 } from "@creit.tech/stellar-wallets-kit";
 import * as StellarSdk from "@stellar/stellar-sdk";
-import { useWalletStore } from "@/store";
-import { getAccountBalances } from "@/lib/stellar/client";
+import { useWalletStore, useUIStore } from "@/store";
+import { usePathname, useRouter } from "next/navigation";
+import { useQueryClient } from "@tanstack/react-query";
+import {
+  getAccountBalances,
+  fundTestnetAccount,
+  submitTransaction,
+  waitForTransaction,
+} from "@/lib/stellar/client";
+import { buildTestnetUsdcMintTx } from "@/lib/stellar/contracts";
+import { useInvoiceStore } from "@/store/invoiceStore";
 import { env } from "@/lib/env";
 import type { WalletProvider } from "@/types";
 
@@ -54,7 +63,52 @@ export function useWallet() {
     setVerified,
     clearVerification,
     isVerificationExpired,
+    updateActivity,
+    isSessionExpired,
   } = useWalletStore();
+  const router = useRouter();
+  const pathname = usePathname();
+  const queryClient = useQueryClient();
+
+  // Debounced activity tracker — updates lastActivityAt at most once per 5s.
+  const activityTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const handleActivity = useCallback(() => {
+    if (activityTimerRef.current) return;
+    activityTimerRef.current = setTimeout(() => {
+      activityTimerRef.current = null;
+      updateActivity();
+    }, 5_000);
+  }, [updateActivity]);
+
+  // Register global activity listeners when connected.
+  useEffect(() => {
+    if (!isConnected) return;
+    window.addEventListener("click", handleActivity, { passive: true });
+    window.addEventListener("keydown", handleActivity, { passive: true });
+    return () => {
+      window.removeEventListener("click", handleActivity);
+      window.removeEventListener("keydown", handleActivity);
+      if (activityTimerRef.current) clearTimeout(activityTimerRef.current);
+    };
+  }, [isConnected, handleActivity]);
+
+  // Check session expiry on page focus and on route change.
+  // Does not disconnect mid-transaction — the signTransaction guard handles that.
+  useEffect(() => {
+    if (!isConnected) return;
+    const checkExpiry = () => {
+      if (isSessionExpired()) {
+        useWalletStore.getState().disconnect();
+        // Inform the user via a custom event; the UI layer can listen and show a toast.
+        if (typeof window !== "undefined") {
+          window.dispatchEvent(new CustomEvent("kora:session-expired"));
+        }
+      }
+    };
+    checkExpiry();
+    window.addEventListener("focus", checkExpiry);
+    return () => window.removeEventListener("focus", checkExpiry);
+  }, [isConnected, pathname, isSessionExpired]);
 
   const connectWallet = useCallback(
     async (walletId: string = FREIGHTER_ID) => {
@@ -67,28 +121,75 @@ export function useWallet() {
       try {
         const raw = await getAccountBalances(addr);
         bal = {
-          xlm: raw["XLM"] || "0",
-          usdc: raw["USDC"] || "0",
-          eurc: raw["EURC"] || "0",
+          xlm: raw.xlm,
+          usdc: raw.usdc,
+          eurc: raw.otherAssets.find((a) => a.code === "EURC")?.balance ?? "0",
         };
       } catch {
         // Account may not be funded yet on testnet
       }
 
-      connect(walletId as WalletProvider, addr, addr);
+      // Get the wallet's network passphrase for validation
+      let walletPassphrase: string | undefined;
+      try {
+        const networkInfo = await (walletKit as any).getNetworkDetails?.();
+        walletPassphrase = networkInfo?.networkPassphrase;
+      } catch {
+        // Some wallet implementations may not support getNetworkDetails; fallback to null
+      }
+
+      connect(walletId as WalletProvider, addr, addr, walletPassphrase);
       if (bal) setBalance(bal);
+      try {
+        const intended = useUIStore.getState().intendedDestination;
+        if (intended) {
+          useUIStore.getState().setIntendedDestination(null);
+          router.push(intended);
+        }
+      } catch {
+        // best-effort redirect; ignore failures
+      }
     },
-    [connect, setBalance]
+    [connect, setBalance],
   );
 
-  const disconnectWallet = useCallback(() => {
+  const disconnectWallet = useCallback(async () => {
+    const walletAddress = address;
     kit = null;
+    queryClient.clear();
+    useInvoiceStore.setState({
+      invoices: [],
+      selectedInvoice: null,
+      searchQuery: "",
+      createDraft: { currency: "USDC" },
+    });
+    if (typeof window !== "undefined") {
+      localStorage.removeItem("kora-wallet");
+    }
     disconnect();
-  }, [disconnect]);
+
+    if (
+      pathname?.startsWith("/dashboard") ||
+      pathname === "/invoice/create" ||
+      pathname?.startsWith("/invoice/create/")
+    ) {
+      router.push("/marketplace");
+    }
+
+    // Best-effort refresh after teardown for any address-bound views.
+    if (walletAddress) {
+      await queryClient.invalidateQueries({
+        predicate: (q) => JSON.stringify(q.queryKey).includes(walletAddress),
+      });
+    }
+  }, [address, disconnect, pathname, queryClient, router]);
 
   const signTransaction = useCallback(
     async (xdr: string): Promise<string> => {
       if (!isConnected) throw new Error("Wallet not connected");
+      // Do not block a transaction already in-flight — session expiry is checked
+      // on focus and route change, not during active signing.
+      updateActivity();
       if (env.NEXT_PUBLIC_ENABLE_MOCK_DATA || xdr.startsWith("mock_")) {
         await new Promise((resolve) => setTimeout(resolve, 1000));
         return `${xdr}_signed`;
@@ -101,7 +202,7 @@ export function useWallet() {
       });
       return result;
     },
-    [isConnected, address]
+    [isConnected, address],
   );
 
   const refreshBalance = useCallback(async () => {
@@ -109,14 +210,35 @@ export function useWallet() {
     try {
       const raw = await getAccountBalances(address);
       setBalance({
-        xlm: raw["XLM"] || "0",
-        usdc: raw["USDC"] || "0",
-        eurc: raw["EURC"] || "0",
+        xlm: raw.xlm,
+        usdc: raw.usdc,
+        eurc: raw.otherAssets.find((a) => a.code === "EURC")?.balance ?? "0",
       });
     } catch {
       // silently fail
     }
   }, [address, setBalance]);
+
+  const fundWalletOnTestnet = useCallback(async () => {
+    if (!address) throw new Error("Wallet not connected");
+    if (env.NEXT_PUBLIC_STELLAR_NETWORK !== "testnet") {
+      throw new Error("Testnet funding is only available on testnet");
+    }
+
+    await fundTestnetAccount(address);
+
+    const usdcMintXdr = await buildTestnetUsdcMintTx(address, address);
+    const signedUsdcMintXdr = await signTransaction(usdcMintXdr);
+    const submit = await submitTransaction(signedUsdcMintXdr);
+    if (submit.status === "ERROR") {
+      throw new Error("USDC faucet transaction submission failed");
+    }
+    if (submit.hash) {
+      await waitForTransaction(submit.hash);
+    }
+
+    await refreshBalance();
+  }, [address, refreshBalance, signTransaction]);
 
   const requestChallenge = useCallback(async (): Promise<string> => {
     try {
@@ -174,7 +296,14 @@ export function useWallet() {
       clearVerification();
       throw error;
     }
-  }, [isConnected, address, publicKey, requestChallenge, setVerified, clearVerification]);
+  }, [
+    isConnected,
+    address,
+    publicKey,
+    requestChallenge,
+    setVerified,
+    clearVerification,
+  ]);
 
   const checkVerification = useCallback((): boolean => {
     if (!isConnected) return false;
@@ -191,16 +320,20 @@ export function useWallet() {
     }
   }, [checkVerification]);
 
+  const verificationValid =
+    isConnected && isVerified && !isVerificationExpired();
+
   return {
     address,
     publicKey,
     isConnected,
     provider,
     balance,
-    isVerified: checkVerification(),
+    isVerified: verificationValid,
     verifiedAt,
     connectWallet,
     disconnectWallet,
+    fundWalletOnTestnet,
     signTransaction,
     refreshBalance,
     requestChallenge,
