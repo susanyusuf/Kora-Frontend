@@ -8,13 +8,74 @@ export interface ContractConfig {
   networkPassphrase: string;
 }
 
-export type TxStatus = "idle" | "building" | "signing" | "submitting" | "success" | "error";
+export type TxStatus =
+  | "idle"
+  | "building"
+  | "simulating"
+  | "signing"
+  | "submitting"
+  | "polling"
+  | "confirmed"
+  | "failed"
+  | "timeout";
 
-export interface TxState {
-  status: TxStatus;
-  hash?: string;
-  error?: string;
+export type TxState =
+  | { status: "idle" }
+  | { status: "building"; startedAt?: number }
+  | { status: "simulating"; startedAt?: number }
+  | { status: "signing"; startedAt?: number }
+  | { status: "submitting"; txHash?: string }
+  | { status: "polling"; txHash: string }
+  | { status: "confirmed"; txHash: string }
+  | { status: "failed"; error: ServiceError; txHash?: string }
+  | { status: "timeout"; txHash?: string };
+
+export type ServiceErrorCode =
+  | "NETWORK_ERROR"
+  | "INVALID_INPUT"
+  | "NOT_AUTHENTICATED"
+  | "UNAUTHORIZED"
+  | "NOT_FOUND"
+  | "ALREADY_FUNDED"
+  | "INSUFFICIENT_BALANCE"
+  | "ALREADY_REPAID"
+  | "CAPACITY_EXCEEDED"
+  | "INVALID_INVOICE_STATE"
+  | "INCORRECT_REPAYMENT_AMOUNT"
+  | "WALLET_ERROR"
+  | "SIGNATURE_REJECTED"
+  | "TRANSACTION_FAILED"
+  | "SIMULATION_FAILED"
+  | "SUBMISSION_FAILED"
+  | "CONFIRMATION_TIMEOUT"
+  | "IPFS_UPLOAD_FAILED"
+  | "RATE_LIMITED"
+  | "UNSUPPORTED_MEDIA_TYPE"
+  | "VALIDATION_FAILED"
+  | "INVALID_RESPONSE"
+  | "FETCH_ERROR"
+  | "INVALID_CID"
+  | "IPFS_ERROR"
+  | "CONTRACT_ERROR"
+  | "SUBMISSION_ERROR"
+  | "CONFIRMATION_ERROR"
+  | "SUBMIT_ERROR"
+  | "INVALID_FORM"
+  | "CREATE_ERROR"
+  | "FUND_ERROR"
+  | "REPAY_ERROR"
+  | "CLAIM_ERROR"
+  | "CANCEL_ERROR"
+  | "NOT_IMPLEMENTED"
+  | "UNKNOWN_ERROR";
+
+export interface ServiceError {
+  code: ServiceErrorCode;
+  message: string;
+  details?: unknown;
+  cause?: unknown;
 }
+
 
 // Mirrors the on-chain Invoice struct from the Soroban contract
 export interface OnChainInvoice {
@@ -43,6 +104,10 @@ export interface FundInvoiceParams {
 }
 
 export interface RepayInvoiceParams {
+  tokenId: bigint;
+}
+
+export interface ClaimYieldParams {
   tokenId: bigint;
 }
 

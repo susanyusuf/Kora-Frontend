@@ -2,7 +2,15 @@
 
 import React from "react";
 import { toast } from "sonner";
+import { useTranslations } from "next-intl";
 import { StellarTxLink } from "@/components/ui/stellar-tx-link";
+import { useUIStore } from "@/store/uiStore";
+
+export type NotificationPreferenceType =
+  | "txConfirmed"
+  | "invoiceFunded"
+  | "maturityReminder"
+  | "yieldAvailable";
 
 interface TxToastProps {
   message: string;
@@ -28,14 +36,25 @@ interface ErrorToastProps {
   description?: string;
   onRetry?: () => void;
   toastId: string | number;
+  retryLabel: string;
+  dismissLabel: string;
 }
 
-export function ErrorToast({ message, description, onRetry, toastId }: ErrorToastProps) {
+export function ErrorToast({
+  message,
+  description,
+  onRetry,
+  toastId,
+  retryLabel,
+  dismissLabel,
+}: ErrorToastProps) {
   return (
     <div role="alert" aria-live="assertive" className="flex flex-col gap-2 w-full">
       <div className="flex flex-col gap-0.5">
         <span className="font-semibold text-destructive">{message}</span>
-        {description && <span className="text-xs text-muted-foreground">{description}</span>}
+        {description && (
+          <span className="text-xs text-muted-foreground">{description}</span>
+        )}
       </div>
       <div className="flex items-center gap-2 mt-1">
         {onRetry && (
@@ -46,14 +65,14 @@ export function ErrorToast({ message, description, onRetry, toastId }: ErrorToas
             }}
             className="rounded bg-destructive px-2.5 py-1 text-xs font-semibold text-destructive-foreground hover:opacity-90 transition-opacity"
           >
-            Retry
+            {retryLabel}
           </button>
         )}
         <button
           onClick={() => toast.dismiss(toastId)}
           className="rounded border border-border bg-transparent px-2.5 py-1 text-xs font-medium text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
         >
-          Dismiss
+          {dismissLabel}
         </button>
       </div>
     </div>
@@ -61,20 +80,36 @@ export function ErrorToast({ message, description, onRetry, toastId }: ErrorToas
 }
 
 export function useToast() {
-  const showLoading = (message: string, id: string | number) => {
+  const notificationPreferences = useUIStore((s) => s.notificationPreferences);
+  const t = useTranslations("transaction");
+
+  const shouldNotify = (type?: NotificationPreferenceType) => {
+    if (!type) return true;
+    return notificationPreferences[type];
+  };
+
+  const showLoading = (
+    message: string,
+    id: string | number,
+    type?: NotificationPreferenceType
+  ) => {
+    if (!shouldNotify(type)) return id;
     return toast.loading(
       <div role="status" aria-live="polite" className="font-medium text-foreground">
         {message}
       </div>,
-      {
-        id,
-        duration: Infinity,
-      }
+      { id, duration: Infinity }
     );
   };
 
-  const showSuccess = (message: string, txHash?: string, id?: string | number) => {
+  const showSuccess = (
+    message: string,
+    txHash?: string,
+    id?: string | number,
+    type?: NotificationPreferenceType
+  ) => {
     const toastId = id ?? Math.random().toString();
+    if (!shouldNotify(type)) return toastId;
     return toast.success(<TxToast message={message} txHash={txHash} />, {
       id: toastId,
       duration: 4000,
@@ -85,20 +120,21 @@ export function useToast() {
     message: string,
     description?: string,
     onRetry?: () => void,
-    id?: string | number
+    id?: string | number,
+    type?: NotificationPreferenceType
   ) => {
     const toastId = id ?? Math.random().toString();
+    if (!shouldNotify(type)) return toastId;
     return toast.error(
       <ErrorToast
         message={message}
         description={description}
         onRetry={onRetry}
         toastId={toastId}
+        retryLabel={t("retry")}
+        dismissLabel={t("dismiss")}
       />,
-      {
-        id: toastId,
-        duration: Infinity, // Persistent (no auto-dismiss)
-      }
+      { id: toastId, duration: Infinity }
     );
   };
 
